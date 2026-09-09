@@ -53,6 +53,7 @@ Deliberate first-cut simplifications (documented, revisit on in-app eval):
   - rank_feature tag boosting is skipped (parity: ob_conn TODOs it as well); pagerank IS applied.
 """
 
+import io
 import json
 import logging
 import os
@@ -242,6 +243,72 @@ class SereneDBConnection(DocStoreConnection):
         finally:
             self._pool.putconn(conn)
 
+    # ---- bulk write path -----------------------------------------------------
+
+    @staticmethod
+    def _copy_field(v) -> str:
+        r"""One value in COPY TEXT format. \N is NULL; backslash, tab, newline and CR
+        must be escaped or the row framing breaks silently mid-stream."""
+        if v is None:
+            return r"\N"
+        if isinstance(v, bool):
+            return "t" if v else "f"
+        if isinstance(v, (int, float)):
+            return repr(v)
+        if isinstance(v, (list, tuple)):
+            if v and isinstance(v[0], (int, float)):
+                return "{" + ",".join(repr(x) for x in v) + "}"
+            parts = []
+            for x in v:
+                x = "" if x is None else str(x)
+                parts.append('"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"')
+            return "{" + ",".join(parts) + "}"
+        return (str(v).replace("\\", "\\\\").replace("\t", "\\t")
+                .replace("\n", "\\n").replace("\r", "\\r"))
+
+    def _copy_upsert(self, cur, index_name: str, cols, val_rows, updates) -> bool:
+        """COPY into a temp table, then upsert from it. True if it worked.
+
+        Returns False rather than raising so the caller can fall back to the literal
+        INSERT: this is a performance path, and a corpus that stops ingesting is a far
+        worse outcome than one that ingests slowly.
+
+        SereneDB has no `CREATE TEMP TABLE (LIKE t)` - it is a syntax error - so the
+        temp table is spelled out from COLUMN_DDL, with the vector columns recovered
+        from their q_<size>_vec name.
+        """
+        try:
+            types = []
+            for c in cols:
+                m = vector_column_pattern.match(c) or vector_column_pattern.match(c[:-2] + "vec")
+                if c in COLUMN_DDL:
+                    types.append(f"{c} {COLUMN_DDL[c].replace(' PRIMARY KEY', '')}")
+                elif m:
+                    types.append(f"{c} FLOAT[{int(m.group('vector_size'))}]")
+                else:
+                    return False                      # unknown column: take the safe path
+            tmp = f"rf_copy_{abs(hash((index_name, cols))) % 10**9}"
+            cur.execute(f"DROP TABLE IF EXISTS {tmp}")
+            cur.execute(f"CREATE TEMP TABLE {tmp} ({', '.join(types)})")
+            buf = io.StringIO()
+            for row in val_rows:
+                buf.write("\t".join(self._copy_field(v) for v in row) + "\n")
+            buf.seek(0)
+            cur.copy_expert(f"COPY {tmp} ({', '.join(cols)}) FROM STDIN", buf)
+            cur.execute(f"INSERT INTO {index_name} ({', '.join(cols)}) "
+                        f"SELECT {', '.join(cols)} FROM {tmp} "
+                        f"ON CONFLICT (id) DO UPDATE SET {updates}")
+            cur.execute(f"DROP TABLE IF EXISTS {tmp}")
+            return True
+        except Exception as e:
+            logger.warning(f"SereneDB COPY path unavailable on {index_name}, "
+                           f"falling back to INSERT: {e}")
+            try:
+                cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            return False
+
     """
     Database operations
     """
@@ -267,8 +334,27 @@ class SereneDBConnection(DocStoreConnection):
         self._run(f"CREATE TABLE IF NOT EXISTS {index_name} ({cols}, {vec} FLOAT[{vector_size}], {vec_n} FLOAT[{vector_size}])", fetch=False)
         self._run(DICTIONARY_DDL, fetch=False)
         fts = ", ".join(f"{c} {DICTIONARY_NAME}" for c in FTS_COLUMNS)
+        # CREATE INDEX IF NOT EXISTS is NOT free when the index already exists.
+        # SereneDB's SereneDBPhysicalCreateIndex::GetGlobalSinkState detects the
+        # existing index and sets created=false, but that only skips the SINK -
+        # the pipeline's child still runs a full parallel scan of the table and
+        # Sink() discards every chunk (`if (!gstate.created) return NEED_MORE_INPUT`).
+        # On this 42.8M-row / 422GB table that is ~4 GB/s across 8 threads for
+        # 40-70s per call, producing nothing. task_executor calls create_idx per
+        # TASK, so concurrent executors kept the box saturated around the clock.
+        # Check the catalog first; the DDL below is only for a genuinely new index.
+        rel = _index_relation(index_name)
+        try:
+            got, _ = self._run(
+                f"SELECT 1 FROM pg_class WHERE relname = '{rel}' LIMIT 1")
+            if got:
+                with self._known_lock:
+                    self._known_tables.add(index_name)
+                return
+        except Exception:
+            pass  # fall through and let IF NOT EXISTS decide
         self._run(
-            f"CREATE INDEX IF NOT EXISTS {_index_relation(index_name)} ON {index_name} "
+            f"CREATE INDEX IF NOT EXISTS {rel} ON {index_name} "
             f"USING inverted (id, {fts}, {vec_n} ivf (metric = 'ip', quant = 'sq8')) "
             f"WITH (optimize_top_k = 'bm25(1.2, 0.75)')",
             fetch=False,
@@ -291,16 +377,42 @@ class SereneDBConnection(DocStoreConnection):
         with self._known_lock:
             self._known_tables.discard(index_name)
 
+    # Errors that actually mean "this table is not there". Anything else - a timeout, a
+    # dropped connection, the server being busy - means WE DO NOT KNOW, and must not be
+    # reported as absence.
+    _MISSING_TABLE_SQLSTATES = frozenset({
+        "42P01",   # undefined_table
+        "3F000",   # invalid_schema_name
+    })
+
     def index_exist(self, index_name: str, dataset_id: str = None) -> bool:
+        """Does the table exist? Raises if it cannot tell.
+
+        The previous form caught EVERY exception and returned False. On a large table
+        under load the probe times out, the caller reads that as "table missing" and runs
+        create_idx -> CREATE INDEX IF NOT EXISTS over the whole relation. That saturates
+        the disk, which makes the next probe time out, which triggers another CREATE
+        INDEX. Observed on a 42.8M-row corpus: several concurrent CREATE INDEX statements
+        running for 20-70s each, sustained at ~4 GB/s of reads, CONTINUING AFTER INGEST
+        WAS STOPPED because the loop feeds itself.
+
+        Absence is now proved from the SQLSTATE rather than assumed from any failure.
+        A caller that gets an exception should retry or fail, not silently create.
+        """
         if index_name in self._known_tables:
             return True
         try:
             self._run(f"SELECT 1 FROM {index_name} LIMIT 0")
-            with self._known_lock:
-                self._known_tables.add(index_name)
-            return True
-        except Exception:
-            return False
+        except Exception as e:
+            code = getattr(e, "pgcode", None) or getattr(getattr(e, "diag", None), "sqlstate", None)
+            if code in self._MISSING_TABLE_SQLSTATES:
+                return False
+            # Unknown failure: say so. Reporting absence here is what caused the
+            # CREATE INDEX storm.
+            raise
+        with self._known_lock:
+            self._known_tables.add(index_name)
+        return True
 
     """
     Filters
@@ -416,15 +528,33 @@ class SereneDBConnection(DocStoreConnection):
                 )
                 search_type = "fulltext"
             elif vec_data:
-                # Similarity threshold goes straight in the ANN scan's WHERE (relies on the
-                # 26.07.4 fix #964 — on <26.07.4 a vector-op predicate here silently emptied the
-                # result and had to be applied outside the scan).
+                # The similarity threshold is deliberately NOT in the WHERE clause.
+                #
+                # Putting it there turns a top-k query into a RADIUS query: SereneDB compiles
+                # it to `Vector Range / Radius <= -0` and enumerates every row inside the
+                # radius (~8.5M of 42.8M) so TOP_N can keep 10. Measured 2026-09-09 on 42.8M
+                # rows: 104,095 ms with the predicate in WHERE, 626 ms without it. 166x.
+                #
+                # It is also not what any sibling backend does. es_conn passes `similarity`
+                # to s.knn() as a POST-FILTER on the k nearest; opensearch_conn does not pass
+                # it at all; infinity_conn hands it to the engine as a native threshold. None
+                # of them let it constrain the search. The WHERE form was a guess at ES intent
+                # and the guess was wrong.
+                #
+                # RAGFlow re-applies it regardless, on a DIFFERENT quantity: search.py builds
+                # post_threshold against the HYBRID score (vector weight + term score), while
+                # this predicate filtered pure vector similarity. So it could drop a chunk with
+                # a strong term match that ES would have returned. Removing it is a correctness
+                # fix as much as a speed one.
+                #
+                # Cost: the IVF index now answers approximately. Measured recall@10 against an
+                # exhaustive baseline - 88% at nprobe=8, 93% at 32, 97% at 128.
                 vec_n = _norm_column(len(vec_data))
                 qv = "ARRAY[" + ",".join(str(float(x)) for x in _l2_normalize(vec_data)) + f"]::FLOAT[{len(vec_data)}]"
                 n = limit if limit > 0 else (vec_topn or 10)
                 rows, _ = self._run(
                     f"SELECT {fields_expr}, -({vec_n} <#> {qv}) + {pagerank_expr} AS _score "
-                    f"FROM {idx} WHERE {filters_expr} AND -({vec_n} <#> {qv}) >= {vec_threshold} "
+                    f"FROM {idx} WHERE {filters_expr} "
                     f"ORDER BY {vec_n} <#> {qv} LIMIT {n} OFFSET {offset}"
                 )
                 search_type = "vector"
@@ -474,7 +604,7 @@ WITH lex AS (
 lexn AS (SELECT id, s / NULLIF(MAX(s) OVER (), 0) AS sn FROM lex),
 vec AS (
     SELECT id, -({vec_n} <#> {qv}) AS sim
-    FROM {idx} WHERE {filters_expr} AND -({vec_n} <#> {qv}) >= {vec_threshold}
+    FROM {idx} WHERE {filters_expr}
     ORDER BY {vec_n} <#> {qv} LIMIT {v_n}),
 fused AS (
     SELECT COALESCE(l.id, v.id) AS id,
@@ -507,7 +637,19 @@ ORDER BY _score DESC LIMIT {n} OFFSET {offset}"""
             return None
         return self._row_to_entity(rows[0], cols)
 
-    def insert(self, rows: list[dict], index_name: str, dataset_id: str = None) -> list[str]:
+    def insert(self, rows: list[dict], index_name: str, dataset_id: str = None,
+               refresh: str | bool = "wait_for") -> list[str]:
+        # `refresh` is accepted and ignored. It exists because the DocStoreConnection
+        # callers pass it positionally - chunk_service.py does
+        #     thread_pool_exec(docStoreConn.insert, chunks, index_name, dataset_id, refresh)
+        # - and every other backend takes it (es_conn, opensearch_conn, infinity_conn all
+        # end `refresh: str | bool = "wait_for"`). Without it every ingest raises
+        #     TypeError: insert() takes from 3 to 4 positional arguments but 5 were given
+        # and the document is marked FAILED, so the corpus simply stops growing.
+        #
+        # Ignored rather than honoured because it is an Elasticsearch concept: ES needs an
+        # explicit refresh before a written doc becomes searchable. SereneDB's write is
+        # already visible to the next statement, so there is nothing to wait for.
         if not rows:
             return []
         if index_name.startswith("ragflow_doc_meta_"):
@@ -563,6 +705,19 @@ ORDER BY _score DESC LIMIT {n} OFFSET {offset}"""
             with conn.cursor() as cur:
                 for cols, val_rows in groups.items():
                     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "id")
+                    # COPY first, literal INSERT only as a fallback. execute_values
+                    # interpolates every value into ONE statement client-side, and a chunk
+                    # carries two 1024-dim float arrays that are ~11 KB each AS TEXT. At
+                    # DOC_BULK_SIZE=4 that is a ~88 KB statement; at 32 it is ~726 KB, and
+                    # the cost is the PARSE, not the write. Measured on this box, same rows,
+                    # same bytes on the wire:
+                    #     literal INSERT   32 rows, 725.8 KB stmt   317.8 ms   100.7 rows/s
+                    #     COPY + upsert    32 rows, 725.3 KB data    20.8 ms  1539.2 rows/s
+                    # 15x, and it is why `Indexing done` was 60% of per-document time with a
+                    # spread of 0.4s to 456s on comparable documents. SereneDB's authors have
+                    # said as much directly: very large SQL strings are not the way in.
+                    if self._copy_upsert(cur, index_name, cols, val_rows, updates):
+                        continue
                     try:
                         psycopg2.extras.execute_values(cur, f"INSERT INTO {index_name} ({', '.join(cols)}) VALUES %s ON CONFLICT (id) DO UPDATE SET {updates}", val_rows, page_size=500)
                     except Exception as e:

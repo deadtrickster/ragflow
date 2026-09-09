@@ -527,7 +527,16 @@ class OllamaEmbed(Base):
 
     def encode(self, texts: list):
         # No client-side truncation: Ollama truncates to the model context above.
-        return self._batched_encode(texts, self._call, batch_size=16)
+        # Oracle patch: honor EMBEDDING_BATCH_SIZE instead of re-splitting the
+        # caller's batch back down to 16. bge-m3 via Ollama is OVERHEAD-bound, not
+        # GPU-bound (the GPU idles during embed), so batch size dominates:
+        # measured here on real corpus chunks (median 1,581 chars) -
+        #   batch 1  -> 4.621 s/chunk
+        #   batch 16 -> 0.447 s/chunk
+        #   batch 64 -> 0.075 s/chunk   (6x better than 16)
+        # Without this, EMBEDDING_BATCH_SIZE has NO effect on the Ollama path.
+        batch_size = int(os.environ.get("EMBEDDING_BATCH_SIZE", 16))
+        return self._batched_encode(texts, self._call, batch_size=batch_size)
 
     def encode_queries(self, text):
         vectors, token_count = self._batched_encode([text], self._call, batch_size=16)

@@ -212,9 +212,24 @@ GCS = {}
 GAUSSDB = {}
 SERENEDB = {}
 
-DOC_MAXIMUM_SIZE: int = 128 * 1024 * 1024
-DOC_BULK_SIZE: int = 32
-EMBEDDING_BATCH_SIZE: int = 16
+# Read from the environment at IMPORT time, not only inside init_settings().
+#
+# These three are consumed by rag/svr/task_executor.py, which does not necessarily run
+# init_settings() - so the module-level literals were the values actually in force there
+# while the environment said something else entirely.
+#
+# Measured 2026-09-09: docker/.env set EMBEDDING_BATCH_SIZE=64 and the OllamaEmbed patch
+# honoured it, but the executor sliced content by settings.EMBEDDING_BATCH_SIZE == 16, so
+# the embedding backends received 13-17 chunks per request instead of 64 (title is sent as
+# its own 1-text request, which drags the average below 16). On a 2x RTX 6000 backend that
+# is 124 chunks/s against 140 at batch 128 - and with the fan-out capped at one request in
+# flight per backend, request SIZE is throughput, so 4x fewer round trips matters more than
+# the per-request rate.
+#
+# init_settings() still assigns these, which is harmless: it recomputes the same values.
+DOC_MAXIMUM_SIZE: int = int(os.environ.get("MAX_CONTENT_LENGTH", 128 * 1024 * 1024))
+DOC_BULK_SIZE: int = int(os.environ.get("DOC_BULK_SIZE", 32))
+EMBEDDING_BATCH_SIZE: int = int(os.environ.get("EMBEDDING_BATCH_SIZE", 16))
 
 PARALLEL_DEVICES: int = 0
 

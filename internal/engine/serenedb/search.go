@@ -196,17 +196,24 @@ func buildFulltextSQL(tableName, fieldsExpr, where, textQuery string, limit, off
 		fieldsExpr, idx, pagerankExpr, idx, where, match, limit, offset)
 }
 
-// buildVectorSQL runs the ANN scan on the normalized shadow column. The
-// similarity threshold goes straight in the WHERE (relies on SereneDB 26.07.4).
+// buildVectorSQL runs the ANN scan on the normalized shadow column.
+//
+// The similarity threshold is deliberately NOT in the WHERE clause. There it
+// compiles to a radius search (`Vector Range / Radius <= -0`) and enumerates
+// every row inside the radius rather than letting the IVF index return top-k:
+// measured 104,095 ms vs 626 ms on 42.8M rows, 166x. No sibling backend does
+// this either - Elasticsearch passes `similarity` as a post-filter on the k
+// nearest, OpenSearch drops it, Infinity hands it to the engine natively - and
+// RAGFlow re-applies it afterwards against the hybrid score anyway.
 func buildVectorSQL(tableName, fieldsExpr, where string, pm parsedMatch, limit, offset int) string {
 	idx := indexRelation(tableName)
 	vecN := normColumn(len(pm.vectorData))
 	qv := vectorLiteral(pm.vectorData)
 	sim := fmt.Sprintf("-(%s <#> %s)", vecN, qv)
 	return fmt.Sprintf(
-		"SELECT %s, %s + %s AS _score FROM %s WHERE %s AND %s >= %s "+
+		"SELECT %s, %s + %s AS _score FROM %s WHERE %s "+
 			"ORDER BY %s <#> %s LIMIT %d OFFSET %d",
-		fieldsExpr, sim, pagerankExpr, idx, where, sim, formatFloat(pm.vecThreshold),
+		fieldsExpr, sim, pagerankExpr, idx, where,
 		vecN, qv, limit, offset)
 }
 
@@ -243,7 +250,7 @@ func buildFusionSQL(tableName, fieldsExpr string, outputFields []string, where s
 lexn AS (SELECT id, s / NULLIF(MAX(s) OVER (), 0) AS sn FROM lex),
 vec AS (
     SELECT id, -(%s <#> %s) AS sim
-    FROM %s WHERE %s AND -(%s <#> %s) >= %s
+    FROM %s WHERE %s
     ORDER BY %s <#> %s LIMIT %d),
 fused AS (
     SELECT COALESCE(l.id, v.id) AS id,
@@ -253,7 +260,7 @@ SELECT %s, f.fs + COALESCE(t.%s, 0) / 100.0 AS _score
 FROM fused f JOIN %s t ON t.id = f.id
 ORDER BY _score DESC LIMIT %d OFFSET %d`,
 		idx, idx, where, match, lexN,
-		vecN, qv, idx, where, vecN, qv, formatFloat(pm.vecThreshold), vecN, qv, vN,
+		vecN, qv, idx, where, vecN, qv, vN,
 		formatWeight(1.0-vw), formatWeight(vw),
 		strings.Join(prefixed, ", "), pagerankField, tableName, n, offset)
 }

@@ -1,0 +1,67 @@
+# lubuntu3 local overrides.
+#
+# The base compose's own `serenedb` service is deliberately NOT started (kept out of
+# COMPOSE_PROFILES): SereneDB runs on the host as a systemd unit built from main HEAD,
+# and the container would publish the same 7890.
+
+services:
+  ragflow-cpu:
+    # workers=8 as of 2026-09-09. Oracle measured 2 == 8 and settled on 2, but the reason
+    # that made extra executors inert no longer holds: back then every embedding went to ONE
+    # ollama instance pinned to -np 1, so executors queued behind a single slot. There are
+    # now three fanout backends on round-robin, so there are three slots to fill.
+    # Measured before the change: 300 documents queued vs 53 running, serened at 169% of
+    # 800% available, disk idle, two of three embedders at zero in-flight - nothing was
+    # saturated, so the limit was executor concurrency rather than any resource.
+    # entrypoint.sh does NOT read this from the environment - it must be on the command line.
+    command:
+      - --enable-adminserver
+      - --init-model-provider-tables
+      - --workers=8
+    volumes:
+      # Local fix: serenedb_conn.insert() is missing the `refresh` parameter that every
+      # other doc-store backend takes and that chunk_service.py passes positionally.
+      # Without it EVERY ingest raises TypeError and the document is marked FAILED.
+      # Upstream bug, tracked in flowy 01M20YS5HS7RHVZYEQASTH7HX7.
+      - ../rag/utils/serenedb_conn.py:/ragflow/rag/utils/serenedb_conn.py:ro
+      # Oracle patch: OllamaEmbed honours EMBEDDING_BATCH_SIZE instead of re-splitting the
+      # caller's batch back down to 16. bge-m3 via Ollama is OVERHEAD-bound, not GPU-bound
+      # (the GPU idles during embed), so batch size is the only real lever:
+      #   batch 16 -> 0.229 s/chunk    batch 64 -> 0.136 s/chunk   (measured, real chunks)
+      - ../rag/llm/embedding_model.py:/ragflow/rag/llm/embedding_model.py:ro
+      # Local fix: the per-document pipeline-log prune deadlocked continuously. It ran
+      #   delete().where(kb_id == X, id.not_in(<1000 ids>))
+      # on EVERY completed document. NOT IN over a 1000-element list cannot use an index, so
+      # InnoDB locked every row matching kb_id - all 15,985 rows share one kb_id here - and
+      # evaluated the list per row: 436 lock structs and 1,405 row locks to delete ONE entry,
+      # fired ~1.7x/s by 8 executors. MySQL logged 82 deadlocks in six minutes; the executors
+      # lose those transactions and stall, and throughput fell to a third with 6 of 10 sample
+      # intervals at zero completions. Patched to a create_time range delete with hysteresis.
+      - ../api/db/services/pipeline_operation_log_service.py:/ragflow/api/db/services/pipeline_operation_log_service.py:ro
+      # Local fix: DOC_BULK_SIZE / EMBEDDING_BATCH_SIZE were module-level literals overridden
+      # only inside init_settings(), which task_executor.py does not run - so the executor
+      # used 16 while docker/.env said 64, and the embedding backends got 13-17 chunks per
+      # request. Now read from the environment at import time.
+      - ../common/settings.py:/ragflow/common/settings.py:ro
+
+# Bind the stack's state to /mnt/data/ragflow rather than anonymous docker volumes, so the
+# migrated MinIO blobs and MySQL live on the big disk and are inspectable without docker.
+volumes:
+  mysql_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/ragflow/mysql_data
+  minio_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/ragflow/minio_data
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/data/ragflow/redis_data

@@ -269,13 +269,34 @@ class PipelineOperationLogService(CommonService):
             obj = cls.save(**log)
 
             limit = int(os.getenv("PIPELINE_OPERATION_LOG_LIMIT", 1000))
+            # Prune by a create_time cutoff, and only once the table is meaningfully over
+            # the limit - not with `id NOT IN (1000 ids)` on every single document.
+            #
+            # The previous form deadlocked continuously under normal ingestion. `NOT IN` over
+            # a 1000-element list cannot use an index, so InnoDB locked EVERY row matching
+            # kb_id and evaluated the list per row. Measured on a 15,985-row table where all
+            # rows share one kb_id: 436 lock structs and 1,405 row locks to delete a single
+            # log entry, fired once per completed document. With 8 executors finishing ~1.7
+            # documents/s, MySQL logged 82 deadlocks in six minutes
+            # ((1213, 'Deadlock found when trying to get lock')); the executors lose those
+            # transactions and stall, and ingest throughput fell to a third with 6 of 10
+            # sample intervals at literally zero completions.
+            #
+            # A cutoff on create_time locks a bounded range instead, and the hysteresis means
+            # the delete runs about once per `limit // 4` documents rather than every one.
             total = cls.model.select().where(cls.model.kb_id == document.kb_id).count()
 
-            if total > limit:
-                keep_ids = [m.id for m in cls.model.select(cls.model.id).where(cls.model.kb_id == document.kb_id).order_by(cls.model.create_time.desc()).limit(limit)]
-
-                deleted = cls.model.delete().where(cls.model.kb_id == document.kb_id, cls.model.id.not_in(keep_ids)).execute()
-                logging.info(f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {document.kb_id}")
+            if total > limit * 5 // 4:
+                cutoff = (cls.model
+                          .select(cls.model.create_time)
+                          .where(cls.model.kb_id == document.kb_id)
+                          .order_by(cls.model.create_time.desc())
+                          .limit(1).offset(limit - 1).scalar())
+                if cutoff is not None:
+                    deleted = cls.model.delete().where(
+                        cls.model.kb_id == document.kb_id,
+                        cls.model.create_time < cutoff).execute()
+                    logging.info(f"[PipelineOperationLogService] Cleaned {deleted} old logs, kept latest {limit} for {document.kb_id}")
 
         return obj
 
