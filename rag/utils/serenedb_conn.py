@@ -239,7 +239,9 @@ class SereneDBConnection(DocStoreConnection):
                 cur.execute(sql, params)
                 if fetch and cur.description is not None:
                     return cur.fetchall(), [d[0] for d in cur.description]
-                return [], []
+                # For DML the second slot carries rowcount rather than column names, so a
+                # caller can learn how much it changed without a preceding COUNT(*).
+                return [], cur.rowcount
         finally:
             self._pool.putconn(conn)
 
@@ -357,6 +359,16 @@ class SereneDBConnection(DocStoreConnection):
             f"CREATE INDEX IF NOT EXISTS {rel} ON {index_name} "
             f"USING inverted (id, {fts}, {vec_n} ivf (metric = 'ip', quant = 'sq8')) "
             f"WITH (optimize_top_k = 'bm25(1.2, 0.75)')",
+            fetch=False,
+        )
+        # doc_id needs its own index: every delete-by-document and every per-document
+        # lookup filters on it, and without this the planner does a SEQ_SCAN of the whole
+        # table. Measured 2026-09-09 on 43.6M rows: 391.8ms per lookup without it. The parse
+        # endpoint issues one delete per document, so ~600 documents cost ~204s of a ~320s
+        # ingest pass - the single largest cost in the pipeline.
+        # Created here rather than by hand so a fresh tenant table is not silently slow.
+        self._run(
+            f"CREATE INDEX IF NOT EXISTS idx_{index_name}_doc_id ON {index_name} (doc_id)",
             fetch=False,
         )
         with self._known_lock:
@@ -750,7 +762,20 @@ ORDER BY _score DESC LIMIT {n} OFFSET {offset}"""
             return True
         condition = dict(condition or {})
         if not index_name.startswith("ragflow_doc_meta_"):
-            condition["kb_id"] = dataset_id
+            # kb_id is a REDUNDANT predicate when doc_id is given, and an expensive one.
+            # A document belongs to exactly one knowledge base, so kb_id cannot change which
+            # rows match once doc_id is fixed - but every row in this table shares the same
+            # kb_id, so the planner picks that non-selective column and scans.
+            # Measured 2026-09-09 on 43.6M rows:
+            #   WHERE doc_id=...                6.8 ms
+            #   WHERE doc_id=... AND kb_id=...  391.8 ms      57x
+            # Indexing around it does not work: a composite on (doc_id, kb_id) gives 113.8ms
+            # and (kb_id, doc_id) gives 101-147ms - both orderings the same, because the
+            # planner satisfies one predicate and post-filters the other either way.
+            # This cost 204s of every ~320s ingest pass: the parse endpoint issues one delete
+            # per document, and 597 x 390ms is the whole trigger phase.
+            if "doc_id" not in condition:
+                condition["kb_id"] = dataset_id
         filters = self._get_filters(condition)
         if not filters:
             return False
@@ -787,15 +812,27 @@ ORDER BY _score DESC LIMIT {n} OFFSET {offset}"""
             return 0
         condition = dict(condition or {})
         if not index_name.startswith("ragflow_doc_meta_"):
-            condition["kb_id"] = dataset_id
+            # kb_id is redundant when doc_id is given, and expensive. A document belongs to
+            # exactly one knowledge base, so kb_id cannot change which rows match - but every
+            # row here shares the same kb_id, so the planner picks that non-selective column
+            # and scans. Measured 2026-09-09 on 43.6M rows:
+            #   WHERE doc_id=...                6.8 ms
+            #   WHERE doc_id=... AND kb_id=...  391.8 ms
+            # Indexing around it does NOT work: composite (doc_id, kb_id) gives 113.8ms and
+            # (kb_id, doc_id) gives 101-147ms - ordering is irrelevant, because the planner
+            # satisfies one predicate and post-filters the other either way.
+            if "doc_id" not in condition:
+                condition["kb_id"] = dataset_id
         filters = self._get_filters(condition)
         if not filters:
             return 0
         where = " AND ".join(filters)
-        rows, _ = self._run(f"SELECT count(*) FROM {index_name} WHERE {where}")
-        n = rows[0][0]
-        if n:
-            self._run(f"DELETE FROM {index_name} WHERE {where}", fetch=False)
+        # No COUNT(*) before the DELETE. That count was 173ms per call on 43.6M rows -
+        # measured 2026-09-09 as 102.8s of a 136.4s parse-trigger phase, 41% of the whole
+        # ingest pass - and for a freshly uploaded document it returns 0, so the DELETE it
+        # guards never even runs. The work existed purely to produce a return value, which
+        # the DELETE itself now reports via rowcount.
+        _, n = self._run(f"DELETE FROM {index_name} WHERE {where}", fetch=False)
         return n
 
     """
