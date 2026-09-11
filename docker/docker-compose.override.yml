@@ -17,7 +17,7 @@ services:
     command:
       - --enable-adminserver
       - --init-model-provider-tables
-      - --workers=8
+      - --workers=16
     volumes:
       # Local fix: serenedb_conn.insert() is missing the `refresh` parameter that every
       # other doc-store backend takes and that chunk_service.py passes positionally.
@@ -38,11 +38,34 @@ services:
       # lose those transactions and stall, and throughput fell to a third with 6 of 10 sample
       # intervals at zero completions. Patched to a create_time range delete with hysteresis.
       - ../api/db/services/pipeline_operation_log_service.py:/ragflow/api/db/services/pipeline_operation_log_service.py:ro
+      # Local fix: close_connection() ran DB.close_stale(age=30) from @app.teardown_request
+      # on EVERY request, and peewee's close_stale closes connections that are IN USE
+      # ("Close any connections that are in-use but were checked out quite some time ago",
+      # playhouse/pool.py). A 32-file upload holds its connection 35-70s, so every other
+      # request's teardown killed it mid-query: pymysql died in _read_bytes with
+      # "ValueError: read of closed file", handed back as repr(error) inside an HTTP 200.
+      # Cost 32-96 documents per occurrence, ~1 upload pass in 6. Raised to 600, peewee's
+      # own default, which comfortably exceeds any real request here.
+      - ../api/db/db_models.py:/ragflow/api/db/db_models.py:ro
+      # Local fix: the task stream was NEVER trimmed. XACK clears the consumer group's
+      # pending list, not the stream, and nothing called XTRIM/XDEL/XADD MAXLEN - so every
+      # task ever enqueued stayed resident. Measured 2026-09-11: te.0.common held 303,620
+      # entries with pending 0 and lag 0 (all consumed and acked) and had eaten the whole
+      # 128MB maxmemory. maxmemory-policy volatile-lru cannot evict a stream (no TTL), so
+      # Redis discarded 306,896 of its own TTL'd cache keys and then REFUSED WRITES,
+      # surfacing as AssertionError("Can't access Redis") in parse-trigger calls and
+      # parking documents at run=0 (133 -> 3,971 in an hour). Both xadd sites now pass
+      # maxlen=REDIS_STREAM_MAXLEN (default 50000), approximate=True.
+      - ../rag/utils/redis_conn.py:/ragflow/rag/utils/redis_conn.py:ro
       # Local fix: DOC_BULK_SIZE / EMBEDDING_BATCH_SIZE were module-level literals overridden
       # only inside init_settings(), which task_executor.py does not run - so the executor
       # used 16 while docker/.env said 64, and the embedding backends got 13-17 chunks per
       # request. Now read from the environment at import time.
       - ../common/settings.py:/ragflow/common/settings.py:ro
+      # Local fix: the executor's idle poll was 5s after a 5ms queue read, costing 62% of
+      # all executor capacity while 1,389 documents sat queued. Now IDLE_POLL_SECONDS,
+      # default 0.25. See the comment at handle_task() for the measurement.
+      - ../rag/svr/task_executor.py:/ragflow/rag/svr/task_executor.py:ro
 
 # Bind the stack's state to /mnt/data/ragflow rather than anonymous docker volumes, so the
 # migrated MinIO blobs and MySQL live on the big disk and are inspectable without docker.

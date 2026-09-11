@@ -17,6 +17,7 @@
 import asyncio
 import logging
 import json
+import os
 import uuid
 
 import valkey as redis
@@ -401,11 +402,35 @@ class RedisDB:
             self.__open__()
         return False
 
+    # ## Task streams MUST be capped, or they grow without bound
+    #
+    # XACK removes an entry from the consumer GROUP's pending list. It does NOT remove it
+    # from the stream. Nothing here ever called XTRIM, XDEL or XADD MAXLEN, so every task
+    # ever enqueued stayed resident for the life of the deployment.
+    #
+    # Measured on lubuntu3, 2026-09-11: te.0.common held 303,620 entries - pending 0,
+    # lag 0, i.e. ALL of them consumed and acked - and had consumed the whole 128MB
+    # maxmemory. maxmemory-policy is volatile-lru, which only evicts keys carrying a TTL,
+    # and a stream has none, so it could not be evicted: Redis instead threw away 306,896
+    # TTL'd keys (its own caches) and then started REFUSING WRITES. Downstream that
+    # surfaced as AssertionError("Can't access Redis") inside parse-trigger calls, which
+    # left documents parked at run=0 - 133 -> 3,971 in one hour - until the queue
+    # approached its target and the producer would have stopped entirely.
+    #
+    # MAXLEN is approximate (~) so Redis trims whole nodes and the call stays O(1).
+    # The bound must comfortably exceed the largest realistic in-flight window, because
+    # MAXLEN drops the OLDEST entries and an old entry may still be PENDING for a dead
+    # consumer awaiting XAUTOCLAIM - trimming that would lose the task outright. With a
+    # 6,000-document queue target the real in-flight maximum is ~10k entries, so the
+    # default here is 5x that.
+    STREAM_MAXLEN = int(os.environ.get("REDIS_STREAM_MAXLEN", "50000"))
+
     def queue_product(self, queue, message) -> bool:
         for _ in range(3):
             try:
                 payload = {"message": json.dumps(message)}
-                self.REDIS.xadd(queue, payload)
+                self.REDIS.xadd(queue, payload,
+                                maxlen=self.STREAM_MAXLEN, approximate=True)
                 return True
             except Exception as e:
                 logging.exception("RedisDB.queue_product " + str(queue) + " got exception: " + str(e))
@@ -491,7 +516,10 @@ class RedisDB:
             try:
                 messages = self.REDIS.xrange(queue, msg_id, msg_id)
                 if messages:
-                    self.REDIS.xadd(queue, messages[0][1])
+                    # Same cap as queue_product: a requeue is an XADD like any other and
+                    # would otherwise grow the stream unbounded on every retry.
+                    self.REDIS.xadd(queue, messages[0][1],
+                                    maxlen=self.STREAM_MAXLEN, approximate=True)
                     self.REDIS.xack(queue, group_name, msg_id)
             except Exception as e:
                 logging.warning("RedisDB.get_pending_msg " + str(queue) + " got exception: " + str(e))
