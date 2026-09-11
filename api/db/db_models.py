@@ -1047,7 +1047,18 @@ def close_connection():
                     # Return this worker thread's connection to the GaussDB pool.
                     DB.close()
             else:
-                DB.close_stale(age=30)
+                # age=30 REAPED THIS SERVER'S OWN IN-USE CONNECTIONS.
+                # peewee's close_stale() closes connections that are IN USE -
+                # playhouse/pool.py: "Close any connections that are in-use but were
+                # checked out quite some time ago" - and this runs from
+                # @app.teardown_request on EVERY request. A 32-file upload holds its
+                # connection for 35-70s (measured), so every other request's teardown
+                # killed it mid-query and pymysql died in _read_bytes with
+                # "ValueError: read of closed file", returned to the client as
+                # repr(error) inside an HTTP 200. Cost 32-96 documents per occurrence,
+                # about one upload pass in six, 2026-09-10/11.
+                # 600 is peewee's own default and comfortably exceeds any real request.
+                DB.close_stale(age=600)
     except Exception as e:
         logging.exception(e)
 
