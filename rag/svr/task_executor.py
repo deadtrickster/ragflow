@@ -1777,6 +1777,9 @@ async def do_handle_task(task):
                 logging.exception(f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
 
 
+IDLE_POLL_SECONDS = float(os.environ.get("IDLE_POLL_SECONDS", "0.25"))
+
+
 async def handle_task() -> bool:
     """Pull one task off the queue and process it.
 
@@ -1787,7 +1790,21 @@ async def handle_task() -> bool:
     global DONE_TASKS, FAILED_TASKS
     redis_msg, task = await collect()
     if not task:
-        await asyncio.sleep(5)
+        # 5s here cost 62% of all executor capacity. The queue read blocks for only 5ms
+        # (redis_conn.py: block=5 - deliberately tiny, because REDIS is a SYNCHRONOUS
+        # StrictRedis called straight from this coroutine, so a longer block would freeze
+        # the whole event loop and every concurrent task_manager with it). A 5ms look
+        # followed by a 5s nap means a task arriving 6ms later waits five seconds.
+        #
+        # Measured 2026-09-10 with 1,389 documents permanently queued and all 5 embedding
+        # backends idle: 541 tasks in 10 minutes, median task 3.07s, executors 38% busy.
+        #   3.07 / (3.07 + 5.00) = 38.0%   <- matches the measurement exactly
+        #   3.07 / (3.07 + 0.25) = 92%
+        # Idle polling is nearly free by comparison: this is a real await, so it blocks
+        # nothing, and each poll is one 5ms XREADGROUP.
+        # The proper fix is running the sync read via asyncio.to_thread() so it can block
+        # for real; this is the safe part of that change.
+        await asyncio.sleep(IDLE_POLL_SECONDS)
         return False
 
     logging.info(f"handle_task begin for task {json.dumps(task)}")
