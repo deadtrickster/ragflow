@@ -67,6 +67,26 @@ services:
       # default 0.25. See the comment at handle_task() for the measurement.
       - ../rag/svr/task_executor.py:/ragflow/rag/svr/task_executor.py:ro
 
+  mysql:
+    # Local: mysqld shipped its 128MB default buffer pool while rag_flow.task alone
+    # is 3.1GB data + 0.9GB indexes - every presweep scan and executor progress
+    # update was served from the (twice-fsck'd) NVMe. COUNT(*) on task: 17.3s cold,
+    # 4.5s "warm" - warm never existed at that pool size. Also relaxing per-update
+    # durability: chunks are re-ingestable state, not bank records, and the fsync
+    # per task-row update was a visible tax during parse bursts (mysql at 73% CPU
+    # with the disk already carrying serened consolidation).
+    # Command REPLACES the base list, so it is replicated in full here.
+    command:
+      --max_connections=1000
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+      --tls_version="TLSv1.2,TLSv1.3"
+      --init-file /data/application/init.sql
+      --binlog_expire_logs_seconds=604800
+      --innodb_buffer_pool_size=4294967296
+      --innodb_flush_log_at_trx_commit=2
+
 # Bind the stack's state to /mnt/data/ragflow rather than anonymous docker volumes, so the
 # migrated MinIO blobs and MySQL live on the big disk and are inspectable without docker.
 volumes:
