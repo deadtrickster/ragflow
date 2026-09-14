@@ -32,6 +32,11 @@ from common.constants import PipelineTaskType, TaskStatus
 from common.misc_utils import get_uuid
 from common.time_utils import current_timestamp, datetime_format
 
+# How many log saves between checks of the per-kb prune threshold. See the comment at
+# the check site; 64 is ~2.5 min of ingest at the measured rate, against a prune
+# cadence of hours.
+PRUNE_CHECK_EVERY = int(os.getenv("PIPELINE_OPERATION_LOG_PRUNE_CHECK_EVERY", 64))
+
 
 # KB-level fan-out pipeline task types (task row carries a fake doc_id; the real
 # participants live in task["doc_ids"]) → the KB ``<type>_task_finish_at`` column
@@ -284,6 +289,19 @@ class PipelineOperationLogService(CommonService):
             #
             # A cutoff on create_time locks a bounded range instead, and the hysteresis means
             # the delete runs about once per `limit // 4` documents rather than every one.
+            #
+            # The count itself is not free: it is an index-only walk of every row of this
+            # kb_id, so it costs O(rows per kb) per saved document. At limit=200000 the arxiv
+            # kb holds ~225k rows and the walk is 20-50 ms, evaluated ~12,000 times an hour
+            # at 3.4 docs/s, for an answer that flips once per ~limit//4 documents. Sampling
+            # it 1 in PRUNE_CHECK_EVERY saves keeps the bound within PRUNE_CHECK_EVERY x
+            # executors rows of the trigger (~1k against a 50k hysteresis band) and removes
+            # ~98% of the scans.
+            # The counter is per executor process; each process samples 1 in
+            # PRUNE_CHECK_EVERY of its own saves, which is the same global rate.
+            cls._prune_check_tick = getattr(cls, "_prune_check_tick", 0) + 1
+            if cls._prune_check_tick % PRUNE_CHECK_EVERY != 0:
+                return obj
             total = cls.model.select().where(cls.model.kb_id == document.kb_id).count()
 
             if total > limit * 5 // 4:
