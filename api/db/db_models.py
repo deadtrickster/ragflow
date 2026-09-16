@@ -1354,6 +1354,12 @@ class Document(DataBaseModel):
 
     class Meta:
         db_table = "document"
+        # (kb_id, run): the dataset list aggregates COUNT(*) per (kb_id, run) for the
+        # parsing-status counters. With only kb_id indexed the query reads every row of
+        # the dataset from the clustered index and groups in a temporary table - 52 s on
+        # a 2.39M-document dataset, i.e. every GET /api/v1/datasets and every MCP
+        # tools/list. With the composite index it is a loose index scan.
+        indexes = ((("kb_id", "run"), False),)
 
 
 class File(DataBaseModel):
