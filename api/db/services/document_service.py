@@ -574,17 +574,41 @@ class DocumentService(CommonService):
     @classmethod
     @DB.connection_context()
     def delete_chunk_images(cls, doc, tenant_id):
-        page = 0
-        page_size = 1000
+        # A document with no chunks has no chunk images, and asking the doc store to prove that
+        # is not free: the filter-only path runs a COUNT(*) plus a LIMIT/OFFSET read per page,
+        # and OFFSET makes page N re-walk the N-1 pages before it.
+        #
+        # Measured 2026-09-22 on this deployment (110M chunks in one tenant index): one page cost
+        # ~0.75s, so a single document delete issued pages indefinitely and NEVER returned. 48
+        # concurrent batch deletes of 200 ids each timed out at 600s having deleted nothing, and
+        # kept scanning server-side for 16 hours after every client had disconnected, because a
+        # Flask worker does not observe the hangup. All 9,431 documents in that repair had
+        # chunk_num = 0 - the loop was paging a 110M-row index to find zero rows.
+        #
+        # chunk_num is RAGFlow's own count, maintained on parse and on chunk edit. A document
+        # whose count is 0 but which somehow holds chunks would be a bookkeeping bug elsewhere;
+        # the cost of trusting it here is a leaked image, against a delete path that otherwise
+        # cannot complete at all.
+        if not doc.chunk_num:
+            return
+
+        # Chunks per document are bounded (tens to low hundreds), so read them in one window
+        # sized from the document's own count rather than paging with a growing OFFSET. The loop
+        # remains only to cover a count that understates reality, and advances by the rows it
+        # actually received.
+        page_size = max(int(doc.chunk_num) + 64, 1024)
+        offset = 0
         while True:
-            chunks = settings.docStoreConn.search(["img_id"], [], {"doc_id": doc.id}, [], OrderByExpr(), page * page_size, page_size, search.index_name(tenant_id), [doc.kb_id])
+            chunks = settings.docStoreConn.search(["img_id"], [], {"doc_id": doc.id}, [], OrderByExpr(), offset, page_size, search.index_name(tenant_id), [doc.kb_id])
             chunk_ids = settings.docStoreConn.get_doc_ids(chunks)
             if not chunk_ids:
                 break
             for cid in chunk_ids:
                 if settings.STORAGE_IMPL.obj_exist(doc.kb_id, cid):
                     settings.STORAGE_IMPL.rm(doc.kb_id, cid)
-            page += 1
+            if len(chunk_ids) < page_size:
+                break
+            offset += len(chunk_ids)
 
     @classmethod
     def remove_wiki_products(cls, doc, tenant_id):

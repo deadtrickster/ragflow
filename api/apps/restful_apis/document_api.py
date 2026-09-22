@@ -41,7 +41,7 @@ from api.db.db_models import API4Conversation, DB
 from api.db.services import duplicate_name
 from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.document_counter_service import release_reparse_counters
-from api.db.db_models import Task
+from api.db.db_models import Document, Task
 from api.db.services.document_service import DocumentService
 from api.db.services.file2document_service import File2DocumentService
 from api.db.services.file_service import FileService
@@ -1190,9 +1190,14 @@ async def delete_documents(tenant_id, dataset_id):
         if len(doc_ids) > 0 and delete_all:
             return get_error_data_result(message=f"should not provide both doc ids and delete_all(true), dataset: {dataset_id}. ")
         if delete_all:
-            doc_ids = [doc.id for doc in DocumentService.query(kb_id=dataset_id)]
+            doc_ids = [doc.id for doc in DocumentService.query(cols=[Document.id], kb_id=dataset_id)]
 
-        dataset_doc_ids = {doc.id for doc in DocumentService.query(kb_id=dataset_id)}
+        # Validate the REQUESTED ids, not the whole dataset. The original built a set of every
+        # document id in the KB - on a 3.1M-document dataset that is 3.1M rows pulled into Python
+        # to check membership of at most a few hundred, and `delete_all` ran the same query twice.
+        # Measured 2026-09-22 on this deployment: a single DELETE of 200 ids could not complete in
+        # 600s, and 48 such calls completed none. get_by_ids() is one indexed IN () lookup.
+        dataset_doc_ids = {doc.id for doc in DocumentService.get_by_ids(doc_ids, cols=[Document.id, Document.kb_id]) if doc.kb_id == dataset_id}
         invalid_ids = [doc_id for doc_id in doc_ids if doc_id not in dataset_doc_ids]
         if invalid_ids:
             return get_error_data_result(message=f"These documents do not belong to dataset {dataset_id} or Document not found: {', '.join(invalid_ids)}")

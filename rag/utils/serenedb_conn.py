@@ -456,6 +456,21 @@ class SereneDBConnection(DocStoreConnection):
                     filters.append(f"{k} IN ({', '.join(_escape(x) for x in v)})")
                 else:
                     filters.append(f"{k} = {_escape(v)}")
+            else:
+                # A predicate this schema cannot represent matches NOTHING. Dropping it instead
+                # turns a narrow query into a full scan of the caller's knowledge base, silently.
+                #
+                # Measured 2026-09-22: remove_wiki_products() asks for
+                #   {"compile_kwd": [...], "source_doc_ids": [doc.id]}
+                # and neither is a column here, so the only surviving filter was kb_id - 42.8M
+                # rows for one KB - which its 1000-row pager then walked in full FOR EVERY
+                # DOCUMENT DELETED. That is the whole reason document deletion never returned.
+                # The same shape applies to the knowledge_graph_kwd cleanup in remove_document.
+                #
+                # No row can carry a column that does not exist, so FALSE is the honest answer
+                # and it makes the omission visible as "no results" rather than as a hang.
+                logger.debug("SereneDB filter on unknown column %r -> no rows can match", k)
+                filters.append("FALSE")
         return filters
 
     """
@@ -495,7 +510,12 @@ class SereneDBConnection(DocStoreConnection):
         fields_expr = ", ".join(output_fields)
 
         condition = dict(condition or {})
-        condition["kb_id"] = dataset_ids
+        # Same rule as delete() below: kb_id is redundant once doc_id is given, and it is the
+        # non-selective column the planner will happily choose instead. Measured 2026-09-09 on
+        # 43.6M rows: doc_id alone 6.8ms, doc_id AND kb_id 391.8ms. Every doc_id-scoped reader
+        # (chunk image cleanup, per-document chunk listing) paid that difference on every page.
+        if "doc_id" not in condition:
+            condition["kb_id"] = dataset_ids
         filters = self._get_filters(condition)
         filters_expr = " AND ".join(filters) if filters else "TRUE"
 
